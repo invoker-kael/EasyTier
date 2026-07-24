@@ -1,0 +1,159 @@
+name: Build EasyTier Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch, tag, or full commit SHA to build"
+        required: true
+        default: "main"
+        type: string
+
+run-name: Windows x64 ${{ inputs.source_ref }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+
+      - name: Record source commit
+        run: |
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=8 HEAD)"
+          echo "SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: x86_64-pc-windows-msvc
+          gui: true
+          pnpm: true
+          pnpm-build-filter: ''
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: easytier-windows-x64-custom
+          cache-targets: false
+
+      - name: Copy Windows runtime files for GUI
+        run: |
+          find "./easytier/third_party/x86_64" -maxdepth 1 -type f \
+            \( -name "*.dll" -o -name "*.sys" \) \
+            -exec cp {} ./easytier-gui/src-tauri/ \;
+
+      - name: Build Windows Core and CLI
+        run: |
+          cargo build --release \
+            --target x86_64-pc-windows-msvc \
+            --features=mimalloc
+
+      - name: Build Windows GUI
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ./easytier-gui
+          args: --verbose --target x86_64-pc-windows-msvc
+
+      - name: Collect Windows artifacts
+        run: |
+          CORE_DIR="artifacts/windows-x86_64/core"
+          GUI_DIR="artifacts/windows-x86_64/gui"
+          TARGET_DIR="target/x86_64-pc-windows-msvc/release"
+          mkdir -p "$CORE_DIR" "$GUI_DIR"
+
+          cp "$TARGET_DIR/easytier-core.exe" "$CORE_DIR/"
+          cp "$TARGET_DIR/easytier-cli.exe" "$CORE_DIR/"
+          find "easytier/third_party/x86_64" -maxdepth 1 -type f \
+            \( -name "*.dll" -o -name "*.sys" \) \
+            -exec cp {} "$CORE_DIR/" \;
+
+          shopt -s nullglob
+          installers=(target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe)
+          if (( ${#installers[@]} == 0 )); then
+            mapfile -t installers < <(
+              find target -type f -path '*/release/bundle/nsis/*.exe'
+            )
+          fi
+          if (( ${#installers[@]} == 0 )); then
+            echo "No NSIS installer was produced." >&2
+            exit 1
+          fi
+          cp "${installers[@]}" "$GUI_DIR/"
+
+          for output_dir in "$CORE_DIR" "$GUI_DIR"; do
+            printf '%s\n' "$SOURCE_SHA" > "$output_dir/SOURCE_COMMIT.txt"
+            {
+              printf 'Repository: %s\n' "$GITHUB_REPOSITORY"
+              printf 'Branch/ref input: %s\n' "${{ inputs.source_ref }}"
+              printf 'Full source commit: %s\n' "$SOURCE_SHA"
+              printf 'Short source commit: %s\n' "$SHORT_SHA"
+              printf 'GitHub run ID: %s\n' "$GITHUB_RUN_ID"
+              printf 'GitHub run number: %s\n' "$GITHUB_RUN_NUMBER"
+              printf 'Runner OS: %s\n' "$RUNNER_OS"
+              printf 'Rust version: %s\n' "$(rustc --version)"
+              printf 'Cargo version: %s\n' "$(cargo --version)"
+              printf 'Node version: %s\n' "$(node --version)"
+              printf 'pnpm version: %s\n' "$(pnpm --version)"
+              printf 'Build target: x86_64-pc-windows-msvc\n'
+              printf 'Build timestamp UTC: %s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              printf 'Notice: Unsigned custom build.\n'
+            } > "$output_dir/BUILD_INFO.txt"
+            (
+              cd "$output_dir"
+              sha256sum -- * > SHA256SUMS.txt
+            )
+          done
+
+      - name: Verify collected artifacts
+        run: |
+          CORE_DIR="artifacts/windows-x86_64/core"
+          GUI_DIR="artifacts/windows-x86_64/gui"
+          test -s "$CORE_DIR/easytier-core.exe"
+          test -s "$CORE_DIR/easytier-cli.exe"
+          find "$CORE_DIR" -maxdepth 1 -type f \
+            \( -name "*.dll" -o -name "*.sys" \) -size +0c | grep -q .
+          find "$GUI_DIR" -maxdepth 1 -type f -name "*.exe" -size +0c \
+            | grep -q .
+          for output_dir in "$CORE_DIR" "$GUI_DIR"; do
+            test "$(cat "$output_dir/SOURCE_COMMIT.txt")" = "$SOURCE_SHA"
+            test -s "$output_dir/SHA256SUMS.txt"
+            while IFS= read -r file; do test -s "$file"; done < <(
+              find "$output_dir" -maxdepth 1 -type f ! -name 'SHA256SUMS.txt'
+            )
+            (cd "$output_dir" && sha256sum --check SHA256SUMS.txt)
+          done
+
+      - name: Upload Windows Core artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-core-windows-x86_64-${{ env.SHORT_SHA }}
+          path: artifacts/windows-x86_64/core/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload Windows GUI artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-gui-windows-x86_64-${{ env.SHORT_SHA }}
+          path: artifacts/windows-x86_64/gui/
+          retention-days: 30
+          if-no-files-found: error

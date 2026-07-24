@@ -47,3 +47,10 @@ easytier-gui/src-tauri/*.sys
 
 # contrib
 go.sum
+
+# Local custom build outputs
+artifacts/
+*.exe
+*.dll
+*.sys
+*.zip
