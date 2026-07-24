@@ -11,7 +11,10 @@ for command in gh git; do
     }
 done
 
-gh auth status
+if ! gh auth status >/dev/null 2>&1; then
+    echo "GitHub CLI is not authenticated. Run: gh auth login" >&2
+    exit 1
+fi
 
 SOURCE_SHA="$(git rev-parse HEAD)"
 DEFAULT_BRANCH="${GITHUB_DEFAULT_BRANCH:-$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')}"
