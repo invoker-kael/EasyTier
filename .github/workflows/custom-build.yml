@@ -1,0 +1,240 @@
+name: Build EasyTier Windows and Docker
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-x86_64:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Show source commit
+        run: |
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      - name: Prepare Windows build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: x86_64-pc-windows-msvc
+          gui: false
+          pnpm: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: easytier-windows-x86_64
+          cache-targets: false
+
+      - name: Build Windows binaries
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --target x86_64-pc-windows-msvc \
+            --package easytier \
+            --features mimalloc
+
+      - name: Collect Windows files
+        run: |
+          TARGET_DIR="target/x86_64-pc-windows-msvc/release"
+          OUTPUT_DIR="artifacts/easytier-windows-x86_64"
+
+          mkdir -p "$OUTPUT_DIR"
+
+          cp "$TARGET_DIR/easytier-core.exe" "$OUTPUT_DIR/"
+          cp "$TARGET_DIR/easytier-cli.exe" "$OUTPUT_DIR/"
+
+          find "easytier/third_party/x86_64" \
+            -maxdepth 1 \
+            -type f \
+            \( -name "*.dll" -o -name "*.sys" \) \
+            -exec cp {} "$OUTPUT_DIR/" \;
+
+          git rev-parse HEAD > "$OUTPUT_DIR/SOURCE_COMMIT.txt"
+
+          ls -la "$OUTPUT_DIR"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-windows-x86_64-${{ github.sha }}
+          path: artifacts/easytier-windows-x86_64/
+          retention-days: 30
+          if-no-files-found: error
+
+  linux-docker-amd64:
+    name: Build Linux and push Docker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Show source commit
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      - name: Prepare Linux build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: x86_64-unknown-linux-musl
+          gui: false
+          pnpm: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: easytier-linux-x86_64
+          cache-targets: false
+
+      - name: Build Linux binaries
+        shell: bash
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --target x86_64-unknown-linux-musl \
+            --package easytier \
+            --features jemalloc
+
+      - name: Collect Linux files
+        shell: bash
+        run: |
+          TARGET_DIR="target/x86_64-unknown-linux-musl/release"
+          OUTPUT_DIR="artifacts/easytier-linux-x86_64"
+          DOCKER_DIR="docker-context"
+
+          mkdir -p "$OUTPUT_DIR"
+          mkdir -p "$DOCKER_DIR"
+
+          cp "$TARGET_DIR/easytier-core" "$OUTPUT_DIR/"
+          cp "$TARGET_DIR/easytier-cli" "$OUTPUT_DIR/"
+
+          chmod 0755 "$OUTPUT_DIR/easytier-core"
+          chmod 0755 "$OUTPUT_DIR/easytier-cli"
+
+          git rev-parse HEAD > "$OUTPUT_DIR/SOURCE_COMMIT.txt"
+
+          cp "$OUTPUT_DIR/easytier-core" "$DOCKER_DIR/"
+          cp "$OUTPUT_DIR/easytier-cli" "$DOCKER_DIR/"
+
+          ls -la "$OUTPUT_DIR"
+          ls -la "$DOCKER_DIR"
+
+      - name: Create Dockerfile
+        shell: bash
+        run: |
+          cat > docker-context/Dockerfile <<'EOF'
+          FROM alpine:latest
+
+          RUN apk add --no-cache tini tzdata
+
+          COPY easytier-core easytier-cli /usr/local/bin/
+
+          RUN chmod 0755 \
+              /usr/local/bin/easytier-core \
+              /usr/local/bin/easytier-cli
+
+          ENV TZ=Asia/Shanghai
+
+          WORKDIR /app
+
+          EXPOSE 11010/tcp
+          EXPOSE 11010/udp
+          EXPOSE 11011/udp
+          EXPOSE 11011/tcp
+          EXPOSE 11012/tcp
+
+          HEALTHCHECK \
+            --interval=30s \
+            --timeout=10s \
+            --start-period=60s \
+            --retries=5 \
+            CMD ["/usr/local/bin/easytier-cli", \
+                 "--rpc-portal", "127.0.0.1:15888", \
+                 "--output", "json", \
+                 "node", "info"]
+
+          ENTRYPOINT ["/sbin/tini", "--", "easytier-core"]
+          EOF
+
+          cat docker-context/Dockerfile
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-linux-x86_64-${{ github.sha }}
+          path: artifacts/easytier-linux-x86_64/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Check Docker Hub secrets
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "$DOCKERHUB_USERNAME" ]]; then
+            echo "DOCKERHUB_USERNAME is not configured."
+            exit 1
+          fi
+
+          if [[ -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "DOCKERHUB_TOKEN is not configured."
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-context
+          file: docker-context/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/easytier-custom:${{ inputs.image_tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/easytier-custom:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/easytier-custom:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
