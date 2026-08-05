@@ -28,7 +28,18 @@ use super::{
 };
 
 const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+// Keep retry ownership in this loop when transport or protocol handshakes stall.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const FEATURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn connect_config_server(
+    connector: &dyn TunnelDialer,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Box<dyn Tunnel>> {
+    time::timeout(timeout, connector.connect())
+        .await
+        .map_err(|_| anyhow::anyhow!("config-server connection timed out after {timeout:?}"))?
+}
 
 /// Normalized config-server endpoint and authentication token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,12 +50,8 @@ pub struct ConfigServerEndpoint {
 
 impl ConfigServerEndpoint {
     pub fn parse(input: &str, supports_scheme: impl FnOnce(&Url) -> bool) -> anyhow::Result<Self> {
-        let endpoint = match Url::parse(input) {
-            Ok(endpoint) => endpoint,
-            Err(_) => format!("udp://config-server.easytier.cn:22020/{input}")
-                .parse()
-                .map_err(|error| anyhow::anyhow!("failed to parse config server URL: {error}"))?,
-        };
+        let endpoint = Url::parse(input)
+            .map_err(|error| anyhow::anyhow!("failed to parse config server URL: {error}"))?;
         if !supports_scheme(&endpoint) {
             anyhow::bail!("unsupported config server scheme: {}", endpoint.scheme());
         }
@@ -168,7 +175,8 @@ where
         connector: Box<dyn TunnelDialer>,
     ) {
         loop {
-            let connection = match connector.connect().await {
+            let connection = match connect_config_server(connector.as_ref(), CONNECT_TIMEOUT).await
+            {
                 Ok(connection) => connection,
                 Err(error) => {
                     tracing::warn!(%error, "failed to connect to config server; retrying");
@@ -195,7 +203,9 @@ where
 
             if support_encryption && web_security::web_secure_tunnel_supported() {
                 drop(session);
-                let connection = match connector.connect().await {
+                let connection = match connect_config_server(connector.as_ref(), CONNECT_TIMEOUT)
+                    .await
+                {
                     Ok(connection) => connection,
                     Err(error) => {
                         connected.store(false, Ordering::Release);
@@ -368,15 +378,68 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::pending,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
+
     use super::*;
+    use crate::tunnel::ring::create_ring_tunnel_pair;
+
+    struct StalledThenReadyDialer {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TunnelDialer for StalledThenReadyDialer {
+        async fn connect(&self) -> anyhow::Result<Box<dyn Tunnel>> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                return pending().await;
+            }
+
+            let (tunnel, _peer) = create_ring_tunnel_pair();
+            Ok(tunnel)
+        }
+
+        fn remote_url(&self) -> Url {
+            "ring://config-server".parse().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_connection_attempt_times_out_and_allows_redial() {
+        let connector = StalledThenReadyDialer {
+            attempts: AtomicUsize::new(0),
+        };
+
+        let error = connect_config_server(&connector, std::time::Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("connection timed out"));
+
+        connect_config_server(&connector, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(connector.attempts.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
-    fn endpoint_normalizes_shorthand_and_non_websocket_paths() {
-        let endpoint = ConfigServerEndpoint::parse("team%2Ftoken", |_| true).unwrap();
+    fn endpoint_normalizes_non_websocket_paths() {
+        let endpoint =
+            ConfigServerEndpoint::parse("udp://example.com/team%2Ftoken", |_| true).unwrap();
         assert_eq!(endpoint.token(), "team/token");
-        assert_eq!(
-            endpoint.connect_url().as_str(),
-            "udp://config-server.easytier.cn:22020"
+        assert_eq!(endpoint.connect_url().as_str(), "udp://example.com");
+    }
+
+    #[test]
+    fn endpoint_rejects_token_shorthand() {
+        let error = ConfigServerEndpoint::parse("team%2Ftoken", |_| true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse config server URL")
         );
     }
 
