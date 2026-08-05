@@ -2940,28 +2940,27 @@ async fn main() -> Result<(), Error> {
             Some(RouteSubCommand::Dump) => handler.handle_route_dump().await?,
         },
         SubCommand::Stun => {
-            timeout(Duration::from_secs(25), async move {
-                let collector = StunInfoCollector::new_with_default_servers();
+            let collector = StunInfoCollector::new_with_default_servers();
+            let ret = timeout(Duration::from_secs(25), async {
                 loop {
                     let ret = collector.get_stun_info();
-                    if ret.udp_nat_type != NatType::Unknown as i32
-                        && ret.tcp_nat_type != NatType::Unknown as i32
-                    {
-                        if cli.output_format == OutputFormat::Json {
-                            match serde_json::to_string_pretty(&ret) {
-                                Ok(json) => println!("{}", json),
-                                Err(e) => eprintln!("Error serializing to JSON: {}", e),
-                            }
-                        } else {
-                            println!("stun info: {:#?}", ret);
-                        }
-                        break;
+                    if ret.udp_nat_type != NatType::Unknown as i32 {
+                        break ret;
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             })
             .await
-            .unwrap();
+            .map_err(|_| anyhow::anyhow!("UDP STUN NAT type detection timed out"))?;
+
+            if cli.output_format == OutputFormat::Json {
+                match serde_json::to_string_pretty(&ret) {
+                    Ok(json) => println!("{}", json),
+                    Err(e) => eprintln!("Error serializing to JSON: {}", e),
+                }
+            } else {
+                println!("stun info: {:#?}", ret);
+            }
         }
         SubCommand::PeerCenter => {
             handler.handle_peer_center().await?;
