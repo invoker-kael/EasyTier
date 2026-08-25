@@ -95,6 +95,23 @@ impl CoreRuntimeConfigStore {
             .send_modify(|version| *version += 1);
     }
 
+    pub(crate) fn replace_with_current(
+        &self,
+        mut config: CoreInstanceRuntimeConfig,
+        merge: impl FnOnce(&CoreInstanceRuntimeConfig, &mut CoreInstanceRuntimeConfig),
+    ) -> Arc<CoreInstanceRuntimeConfig> {
+        let _update = self.inner.update.lock();
+        let current = self.inner.snapshot.load_full();
+        merge(&current, &mut config);
+        let config = Arc::new(config);
+        self.inner.snapshot.store(config.clone());
+        self.inner.peer_changes.send_modify(|version| *version += 1);
+        self.inner
+            .service_changes
+            .send_modify(|version| *version += 1);
+        config
+    }
+
     pub fn update_services(&self, update: impl FnOnce(&mut CoreRuntimeConfig)) {
         let _update = self.inner.update.lock();
         let mut config = self.inner.snapshot.load_full().as_ref().clone();
@@ -127,6 +144,15 @@ impl CoreRuntimeConfigStore {
 
     pub fn subscribe_service_runtime_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.inner.service_changes.subscribe()
+    }
+    #[cfg(test)]
+    pub(crate) fn peer_change_subscriber_count(&self) -> usize {
+        self.inner.peer_changes.receiver_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn service_change_subscriber_count(&self) -> usize {
+        self.inner.service_changes.receiver_count()
     }
 }
 

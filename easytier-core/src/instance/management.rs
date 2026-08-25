@@ -8,7 +8,9 @@ use crate::{
     foundation::stats::MetricSnapshot,
     peers::{
         conn::peer_conn::PeerConnId,
-        credential_manager::{CredentialCreateOptions, CredentialInfo, GeneratedCredential},
+        credential_manager::{
+            CredentialCreateOptions, CredentialInfo, CredentialUpsertOptions, GeneratedCredential,
+        },
         peer_manager::PeerSnapshot,
     },
 };
@@ -155,14 +157,8 @@ where
         let generated = self
             .peer_manager
             .credential_manager()
-            .generate_credential_with_options(
-                options.groups,
-                options.allow_relay,
-                options.allowed_proxy_cidrs,
-                options.ttl,
-                options.credential_id,
-                options.reusable,
-            );
+            .generate_credential_with_options(options)
+            .map_err(anyhow::Error::msg)?;
         self.peer_manager.notify_credential_changed();
         Ok(generated)
     }
@@ -174,15 +170,43 @@ where
         let revoked = self
             .peer_manager
             .credential_manager()
-            .revoke_credential(credential_id);
+            .revoke_credential(credential_id)
+            .map_err(anyhow::Error::msg)?;
         if revoked {
             self.peer_manager.notify_credential_changed();
         }
         Ok(revoked)
     }
 
+    pub fn upsert_credential(&self, options: CredentialUpsertOptions) -> anyhow::Result<bool> {
+        if !self.peer_manager.can_manage_credentials() {
+            anyhow::bail!("only admin nodes (with network_secret) can import credentials");
+        }
+        let changed = self
+            .peer_manager
+            .credential_manager()
+            .upsert_credential(options)
+            .map_err(anyhow::Error::msg)?;
+        if changed {
+            self.peer_manager.notify_credential_changed();
+        }
+        Ok(changed)
+    }
+
     pub fn credential_snapshots(&self) -> Vec<CredentialInfo> {
         self.peer_manager.credential_manager().list_credentials()
+    }
+
+    #[cfg(feature = "web-client")]
+    pub(crate) fn credential_manager(
+        &self,
+    ) -> Arc<crate::peers::credential_manager::CredentialManager> {
+        self.peer_manager.credential_manager()
+    }
+
+    #[cfg(feature = "web-client")]
+    pub(crate) fn notify_credential_changed(&self) {
+        self.peer_manager.notify_credential_changed();
     }
 
     pub fn metric_snapshots(&self) -> Vec<MetricSnapshot> {
