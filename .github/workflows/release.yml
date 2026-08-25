@@ -89,6 +89,7 @@ jobs:
         with:
           name: ${{ inputs.version }}
           draft: true
+          body_path: RELEASE_NOTES_2.6.4.2.md
           files: |
             ./zipped_assets/*
           token: ${{ secrets.GITHUB_TOKEN }}
