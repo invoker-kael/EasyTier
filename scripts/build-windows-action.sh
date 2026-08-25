@@ -35,7 +35,7 @@ for _ in $(seq 1 30); do
         --event workflow_dispatch \
         --created ">=${START_TIME}" \
         --json databaseId,displayTitle \
-        --jq ".[] | select(.displayTitle == \\\"${RUN_TITLE}\\\") | .databaseId" \
+        --jq ".[] | select(.displayTitle == \"${RUN_TITLE}\") | .databaseId" \
         --limit 100 | head -n 1)"
     [[ -n "${RUN_ID}" ]] && break
     sleep 2
