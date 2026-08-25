@@ -96,15 +96,16 @@ impl SmoltcpPlane {
                     tcp_rx_size: 1024 * 128,
                     tcp_tx_size: 1024 * 128,
                     udp_rx_size: 1024 * 128,
+                    udp_tx_size: 1024 * 128,
                     udp_rx_meta_size: 128,
-                    ..Default::default()
+                    udp_tx_meta_size: 128,
                 }),
             ),
         );
 
         let forward_tasks = Arc::new(std::sync::Mutex::new(forward_tasks));
         forward_tasks.lock().unwrap().spawn(reap_joinset_background(
-            forward_tasks.clone(),
+            Arc::downgrade(&forward_tasks),
             "SmoltcpPlane",
         ));
 
