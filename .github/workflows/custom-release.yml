@@ -287,10 +287,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v5
         with:
+          pattern: custom-*
           path: release-assets
+          merge-multiple: false
       - name: Show release files
         shell: bash
-        run: find release-assets -type f -maxdepth 3 -print
+        run: find release-assets -maxdepth 3 -type f -print
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
