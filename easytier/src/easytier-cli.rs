@@ -279,7 +279,7 @@ enum VpnPortalSubCommand {
     AddClient {
         #[arg(help = "client name")]
         name: String,
-        #[arg(long, help = "client virtual IPv4 address inside the mesh network")]
+        #[arg(long, help = "client virtual IPv4 CIDR inside the mesh network")]
         virtual_ip: String,
         #[arg(long, help = "ACL groups assigned to the client")]
         groups: Vec<String>,
@@ -612,6 +612,16 @@ fn is_missing_web_client_service(error: &RpcError) -> bool {
     )
 }
 
+fn parse_vpn_portal_client_cidr(value: &str) -> anyhow::Result<cidr::Ipv4Inet> {
+    let value = value.trim();
+    if !value.contains('/') {
+        anyhow::bail!("client virtual IPv4 must include its network prefix");
+    }
+    value
+        .parse::<cidr::Ipv4Inet>()
+        .map_err(|error| anyhow::anyhow!("invalid client virtual IPv4 CIDR ({value}): {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +645,13 @@ mod tests {
         let error = RpcError::InvalidServiceKey("PeerManageRpc".to_string(), "".to_string());
 
         assert!(!is_missing_web_client_service(&error));
+    }
+
+    #[test]
+    fn vpn_portal_client_requires_a_complete_ipv4_cidr() {
+        let client = parse_vpn_portal_client_cidr("10.90.0.2/16").unwrap();
+        assert_eq!(client.to_string(), "10.90.0.2/16");
+        assert!(parse_vpn_portal_client_cidr("10.90.0.2").is_err());
     }
 
     #[test]
@@ -2014,8 +2031,8 @@ impl<'a> CommandHandler<'a> {
     }
 
     async fn handle_acl_set(&self, raw: &str) -> Result<(), Error> {
-        // Load the TOML content either from a file (`@path`) or inline.
-        let toml_text = if let Some(path) = raw.strip_prefix('@') {
+        // Load the content either from a file (`@path`) or inline.
+        let text = if let Some(path) = raw.strip_prefix('@') {
             tokio::fs::read_to_string(path)
                 .await
                 .with_context(|| format!("failed to read ACL file `{path}`"))?
@@ -2023,16 +2040,40 @@ impl<'a> CommandHandler<'a> {
             raw.to_string()
         };
 
-        // The input mirrors the `[acl]` section of an easytier TOML config, so
-        // we wrap the parsed `Acl` inside a top-level `acl` table.
+        // Try parsing as JSON first, then fallback to TOML if JSON parsing fails.
         #[derive(serde::Deserialize, Default)]
-        struct AclToml {
+        struct AclWrapper {
             acl: Option<Acl>,
         }
 
-        let parsed: AclToml = toml::from_str(&toml_text)
-            .with_context(|| "failed to parse ACL TOML (expected `[acl.acl_v1]` structure)")?;
-        let acl = parsed.acl.unwrap_or_default();
+        // Your JSON file includes a full PatchConfigRequest structure: {"instance": ..., "patch": {"acl": {"acl": ...}}}
+        // Let's support parsing full PatchConfigRequest or patch payload or Acl directly.
+        #[derive(serde::Deserialize, Default)]
+        struct PatchRequestJson {
+            patch: Option<InstanceConfigPatch>,
+        }
+
+        let acl = if let Ok(parsed_req) = serde_json::from_str::<PatchRequestJson>(&text) {
+            parsed_req
+                .patch
+                .and_then(|p| p.acl)
+                .and_then(|a| a.acl)
+                .unwrap_or_default()
+        } else if let Ok(parsed_json) = serde_json::from_str::<AclWrapper>(&text) {
+            parsed_json.acl.unwrap_or_default()
+        } else if let Ok(parsed_json_direct) = serde_json::from_str::<Acl>(&text) {
+            parsed_json_direct
+        } else {
+            // Fallback to TOML
+            #[derive(serde::Deserialize, Default)]
+            struct AclToml {
+                acl: Option<Acl>,
+            }
+            let parsed_toml: AclToml = toml::from_str(&text).with_context(
+                || "failed to parse ACL as either JSON or TOML (expected `[acl.acl_v1]` structure)",
+            )?;
+            parsed_toml.acl.unwrap_or_default()
+        };
         if acl.is_empty() {
             anyhow::bail!(
                 "parsed ACL is empty; provide at least one chain or a non-empty group under `[acl.acl_v1]`"
@@ -2725,9 +2766,7 @@ impl<'a> CommandHandler<'a> {
         virtual_ip: String,
         groups: Vec<String>,
     ) -> Result<(), Error> {
-        virtual_ip
-            .parse::<std::net::Ipv4Addr>()
-            .map_err(|e| anyhow::anyhow!("invalid virtual ip ({virtual_ip}): {e}"))?;
+        let virtual_ip = parse_vpn_portal_client_cidr(&virtual_ip)?.to_string();
         self.apply_to_instances(|handler| {
             let name = name.clone();
             let virtual_ip = virtual_ip.clone();

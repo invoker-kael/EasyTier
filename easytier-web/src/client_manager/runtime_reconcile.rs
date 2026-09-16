@@ -28,7 +28,7 @@ use easytier::{
 use super::session::{SessionConfigClient, SessionRpcClient};
 
 pub(super) enum RuntimeReconcileAction {
-    None,
+    Unchanged(Box<NetworkConfig>),
     Run {
         config: Box<NetworkConfig>,
         overwrite: bool,
@@ -64,6 +64,7 @@ fn hot_patch_base(config: &NetworkConfig) -> anyhow::Result<NetworkConfig> {
     config.port_forwards.clear();
     config.proxy_cidrs.clear();
     config.disable_relay_data = None;
+    config.prefer_peer_relay = None;
     // VPN portal clients are diffed separately; the listener identity
     // (address and private key) decides between patch and recreate.
     config.vpn_portal_config = None;
@@ -211,6 +212,10 @@ fn normalized_disable_relay_data(config: &NetworkConfig) -> anyhow::Result<bool>
     Ok(config.gen_config()?.get_flags().disable_relay_data)
 }
 
+fn normalized_prefer_peer_relay(config: &NetworkConfig) -> anyhow::Result<bool> {
+    Ok(config.gen_config()?.get_flags().prefer_peer_relay)
+}
+
 fn normalized_vpn_portal(config: &NetworkConfig) -> anyhow::Result<Option<RuntimeVpnPortalConfig>> {
     Ok(config.gen_config()?.get_vpn_portal_config())
 }
@@ -264,27 +269,47 @@ fn normalized_managed_credentials(
     Ok(NetworkConfig::new_from_config(config.gen_config()?)?.managed_credentials)
 }
 
+fn is_automatic_windows_dev_name(dev_name: &str) -> bool {
+    let Some((interface_count, suffix)) = dev_name
+        .strip_prefix("et_")
+        .and_then(|value| value.split_once('_'))
+    else {
+        return false;
+    };
+    !interface_count.is_empty()
+        && interface_count.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.len() == 4
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
 fn web_source_runtime_patch(
     current: &NetworkConfig,
     desired: &NetworkConfig,
 ) -> anyhow::Result<Option<InstanceConfigPatch>> {
-    if let Some(desired_hostname) = desired
-        .hostname
-        .as_deref()
-        .filter(|hostname| !hostname.is_empty())
-        && current.hostname.as_deref() != Some(desired_hostname)
-    {
-        return Ok(None);
-    }
     let mut current_base = hot_patch_base(current)?;
     let mut desired_base = hot_patch_base(desired)?;
-    current_base.hostname = None;
-    desired_base.hostname = None;
+    if desired.dev_name.is_none()
+        || (desired.dev_name.as_deref() == Some("")
+            && current
+                .dev_name
+                .as_deref()
+                .is_some_and(is_automatic_windows_dev_name))
+    {
+        current_base.dev_name = None;
+        desired_base.dev_name = None;
+    }
+    let current_hostname = current_base.hostname.take().unwrap_or_default();
+    let desired_hostname = desired_base.hostname.take().unwrap_or_default();
     if current_base != desired_base {
         return Ok(None);
     }
 
     let mut patch = InstanceConfigPatch::default();
+    if desired.hostname.is_some() && current_hostname != desired_hostname {
+        patch.hostname = Some(desired_hostname);
+    }
     let current_acl = normalized_acl(&current.acl);
     let desired_acl = normalized_acl(&desired.acl);
     if current_acl != desired_acl {
@@ -314,6 +339,12 @@ fn web_source_runtime_patch(
     let desired_disable_relay_data = normalized_disable_relay_data(desired)?;
     if current_disable_relay_data != desired_disable_relay_data {
         patch.disable_relay_data = Some(desired_disable_relay_data);
+    }
+
+    let current_prefer_peer_relay = normalized_prefer_peer_relay(current)?;
+    let desired_prefer_peer_relay = normalized_prefer_peer_relay(desired)?;
+    if current_prefer_peer_relay != desired_prefer_peer_relay {
+        patch.prefer_peer_relay = Some(desired_prefer_peer_relay);
     }
 
     match (
@@ -347,14 +378,41 @@ fn web_source_runtime_patch(
     Ok(Some(patch))
 }
 
-fn ensure_runtime_config_converged(
+// Release 2.6.4 omits a configured hostname that matches the device
+// hostname from config readback. After a successful hostname mutation the
+// desired value must be restored into the observed config, otherwise every
+// later plan re-sends the same hostname patch.
+pub(super) fn restore_omitted_hostname(
+    current: &mut NetworkConfig,
+    desired: &NetworkConfig,
+    hostname_applied: bool,
+) {
+    if hostname_applied && current.hostname.is_none() && desired.hostname.is_some() {
+        current.hostname = desired.hostname.clone();
+    }
+}
+
+pub(super) fn ensure_runtime_config_converged(
     current: &NetworkConfig,
     desired: &NetworkConfig,
+    hostname_applied: bool,
 ) -> anyhow::Result<()> {
     let patch = web_source_runtime_patch(current, desired)?;
     match patch {
-        Some(patch) if patch == InstanceConfigPatch::default() => Ok(()),
-        Some(_) => anyhow::bail!("runtime config still needs patch after reconcile"),
+        Some(mut patch) => {
+            // Release 2.6.4 omits a configured hostname when it equals
+            // the device hostname. The successful mutation is therefore
+            // authoritative for hostname, while every other field remains
+            // verified from the runtime readback.
+            if hostname_applied && current.hostname.is_none() {
+                patch.hostname = None;
+            }
+            if patch == InstanceConfigPatch::default() {
+                Ok(())
+            } else {
+                anyhow::bail!("runtime config still needs patch after reconcile")
+            }
+        }
         None => anyhow::bail!("runtime config still needs full overwrite after reconcile"),
     }
 }
@@ -418,13 +476,19 @@ pub(super) fn prepare_web_source_runtime_reconcile_from_current(
     desired_config: NetworkConfig,
 ) -> anyhow::Result<RuntimeReconcileAction> {
     let Some(patch) = web_source_runtime_patch(current_config, &desired_config)? else {
+        let mut run_config = desired_config;
+        if run_config.hostname.is_none() {
+            run_config.hostname = current_config.hostname.clone();
+        }
         return Ok(RuntimeReconcileAction::Run {
-            config: Box::new(desired_config),
+            config: Box::new(run_config),
             overwrite: true,
         });
     };
     if patch == InstanceConfigPatch::default() {
-        return Ok(RuntimeReconcileAction::None);
+        return Ok(RuntimeReconcileAction::Unchanged(Box::new(
+            current_config.clone(),
+        )));
     }
 
     Ok(RuntimeReconcileAction::Patch(Box::new(patch)))
@@ -438,12 +502,17 @@ pub(super) async fn apply_web_source_runtime_reconcile(
     action: RuntimeReconcileAction,
 ) -> anyhow::Result<NetworkConfig> {
     match action {
-        RuntimeReconcileAction::None => Ok(desired_config),
+        RuntimeReconcileAction::Unchanged(current_config) => Ok(*current_config),
         RuntimeReconcileAction::Run { config, overwrite } => {
+            let hostname_applied = config.hostname.is_some();
             run_web_source_instance(rpc_client, inst_id, *config, overwrite).await?;
-            Ok(desired_config)
+            let mut current_config = get_runtime_config(rpc_client, inst_id).await?;
+            ensure_runtime_config_converged(&current_config, &desired_config, hostname_applied)?;
+            restore_omitted_hostname(&mut current_config, &desired_config, hostname_applied);
+            Ok(current_config)
         }
         RuntimeReconcileAction::Patch(patch) => {
+            let hostname_applied = patch.hostname.is_some();
             config_client
                 .patch_config(
                     BaseController::default(),
@@ -453,8 +522,9 @@ pub(super) async fn apply_web_source_runtime_reconcile(
                     },
                 )
                 .await?;
-            let current_config = get_runtime_config(rpc_client, inst_id).await?;
-            ensure_runtime_config_converged(&current_config, &desired_config)?;
+            let mut current_config = get_runtime_config(rpc_client, inst_id).await?;
+            ensure_runtime_config_converged(&current_config, &desired_config, hostname_applied)?;
+            restore_omitted_hostname(&mut current_config, &desired_config, hostname_applied);
             Ok(current_config)
         }
     }
@@ -557,15 +627,15 @@ mod tests {
     fn vpn_portal_client_changes_produce_hot_patches() {
         let current = config_with_vpn_portal(
             vec![
-                portal_client("alice", "10.144.144.4"),
-                portal_client("carol", "10.144.144.6"),
+                portal_client("alice", "10.144.144.4/24"),
+                portal_client("carol", "10.144.144.6/24"),
             ],
             "0.0.0.0:22121",
         );
         let desired = config_with_vpn_portal(
             vec![
-                portal_client("bob", "10.144.144.5"),
-                portal_client("carol", "10.144.144.7"),
+                portal_client("bob", "10.144.144.5/24"),
+                portal_client("carol", "10.144.144.7/24"),
             ],
             "0.0.0.0:22121",
         );
@@ -584,16 +654,24 @@ mod tests {
             ],
             "removals must precede additions; changed clients are remove+add"
         );
+        let added = patch
+            .vpn_portal_clients
+            .iter()
+            .filter(|item| item.action == ConfigPatchAction::Add as i32)
+            .filter_map(|item| item.client.as_ref())
+            .map(|client| client.virtual_ip.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(added, ["10.144.144.5/24", "10.144.144.7/24"]);
     }
 
     #[test]
     fn vpn_portal_client_no_op_produces_empty_patch_section() {
         let current = config_with_vpn_portal(
-            vec![portal_client("alice", "10.144.144.4")],
+            vec![portal_client("alice", "10.144.144.4/24")],
             "0.0.0.0:22121",
         );
         let desired = config_with_vpn_portal(
-            vec![portal_client("alice", "10.144.144.4")],
+            vec![portal_client("alice", "10.144.144.4/24")],
             "0.0.0.0:22121",
         );
 
@@ -606,11 +684,11 @@ mod tests {
     #[test]
     fn vpn_portal_listener_identity_change_requires_recreate() {
         let current = config_with_vpn_portal(
-            vec![portal_client("alice", "10.144.144.4")],
+            vec![portal_client("alice", "10.144.144.4/24")],
             "0.0.0.0:22121",
         );
         let desired = config_with_vpn_portal(
-            vec![portal_client("alice", "10.144.144.4")],
+            vec![portal_client("alice", "10.144.144.4/24")],
             "0.0.0.0:22122",
         );
         assert!(
@@ -641,7 +719,7 @@ mod tests {
     fn vpn_portal_enable_or_disable_requires_recreate() {
         let without_portal = config_with_port_forwards(Vec::new());
         let with_portal = config_with_vpn_portal(
-            vec![portal_client("alice", "10.144.144.4")],
+            vec![portal_client("alice", "10.144.144.4/24")],
             "0.0.0.0:22121",
         );
 
@@ -741,6 +819,63 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reconcile_ignores_automatic_device_name_when_unmanaged() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.dev_name = Some("et_3_abcd".to_string());
+        let desired = config_with_port_forwards(Vec::new());
+
+        let action = prepare_web_source_runtime_reconcile_from_current(&current, desired)
+            .expect("prepare reconcile");
+
+        assert!(matches!(action, RuntimeReconcileAction::Unchanged(_)));
+    }
+
+    #[test]
+    fn runtime_reconcile_ignores_automatic_device_name_for_empty_desired_name() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.dev_name = Some("et_3_abcd".to_string());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.dev_name = Some(String::new());
+
+        let action = prepare_web_source_runtime_reconcile_from_current(&current, desired)
+            .expect("prepare reconcile");
+
+        assert!(matches!(action, RuntimeReconcileAction::Unchanged(_)));
+    }
+
+    #[test]
+    fn runtime_reconcile_clears_explicit_device_name() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.dev_name = Some("managed-device".to_string());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.dev_name = Some(String::new());
+
+        let action = prepare_web_source_runtime_reconcile_from_current(&current, desired)
+            .expect("prepare reconcile");
+        let RuntimeReconcileAction::Run { overwrite, .. } = action else {
+            panic!("clearing an explicit device name should require a full overwrite");
+        };
+
+        assert!(overwrite);
+    }
+
+    #[test]
+    fn runtime_reconcile_applies_explicit_device_name() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.dev_name = Some("et_3_abcd".to_string());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.dev_name = Some("managed-device".to_string());
+
+        let action = prepare_web_source_runtime_reconcile_from_current(&current, desired)
+            .expect("prepare reconcile");
+        let RuntimeReconcileAction::Run { overwrite, .. } = action else {
+            panic!("explicit device name should require a full overwrite");
+        };
+
+        assert!(overwrite);
+    }
+
+    #[test]
     fn runtime_convergence_rejects_stale_extra_port_forward() {
         let current = config_with_port_forwards(vec![
             port_forward(23000, 5174),
@@ -750,7 +885,7 @@ mod tests {
         let desired =
             config_with_port_forwards(vec![port_forward(23000, 5174), port_forward(23007, 3389)]);
 
-        let err = ensure_runtime_config_converged(&current, &desired)
+        let err = ensure_runtime_config_converged(&current, &desired, false)
             .expect_err("extra runtime port forward should not converge");
 
         assert!(
@@ -772,18 +907,49 @@ mod tests {
             .expect("hot patch");
 
         assert_eq!(patch, InstanceConfigPatch::default());
-        ensure_runtime_config_converged(&current, &desired).expect("runtime converged");
+        ensure_runtime_config_converged(&current, &desired, false).expect("runtime converged");
     }
 
     #[test]
     fn runtime_patch_rejects_non_hot_config_change() {
         let current = config_with_port_forwards(Vec::new());
         let mut desired = current.clone();
+
         desired.network_secret = Some("new-secret".to_string());
 
         let patch = web_source_runtime_patch(&current, &desired).expect("build patch");
 
         assert!(patch.is_none());
+    }
+
+    #[test]
+    fn full_overwrite_preserves_unmanaged_hostname_for_later_explicit_clear() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.hostname = Some("runtime-host".to_string());
+        let mut unmanaged_desired = current.clone();
+        unmanaged_desired.hostname = None;
+        unmanaged_desired.network_secret = Some("new-secret".to_string());
+
+        let action =
+            prepare_web_source_runtime_reconcile_from_current(&current, unmanaged_desired.clone())
+                .expect("prepare full overwrite");
+        let RuntimeReconcileAction::Run { config, overwrite } = action else {
+            panic!("non-hot change should require a full overwrite");
+        };
+        assert!(overwrite);
+        assert_eq!(config.hostname.as_deref(), Some("runtime-host"));
+
+        let observed_after_run = *config;
+        let mut explicit_clear = unmanaged_desired;
+        explicit_clear.hostname = Some(String::new());
+        let action =
+            prepare_web_source_runtime_reconcile_from_current(&observed_after_run, explicit_clear)
+                .expect("prepare explicit clear");
+        let RuntimeReconcileAction::Patch(patch) = action else {
+            panic!("explicit clear should patch the preserved runtime hostname");
+        };
+
+        assert_eq!(patch.hostname.as_deref(), Some(""));
     }
 
     #[test]
@@ -944,6 +1110,20 @@ mod tests {
     }
 
     #[test]
+    fn runtime_patch_updates_peer_relay_preference_independently() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = current.clone();
+        desired.prefer_peer_relay = Some(true);
+
+        let patch = web_source_runtime_patch(&current, &desired)
+            .expect("build patch")
+            .expect("hot patch");
+
+        assert_eq!(patch.prefer_peer_relay, Some(true));
+        assert_eq!(patch.disable_relay_data, None);
+    }
+
+    #[test]
     fn runtime_patch_still_rejects_unsupported_flag_change() {
         let current = config_with_port_forwards(Vec::new());
         let mut desired = current.clone();
@@ -1053,14 +1233,136 @@ mod tests {
     }
 
     #[test]
-    fn runtime_patch_rejects_explicit_desired_hostname_change() {
-        let current = config_with_port_forwards(vec![port_forward(23000, 5174)]);
-        let mut desired =
-            config_with_port_forwards(vec![port_forward(23000, 5174), port_forward(23007, 3389)]);
+    fn runtime_reconcile_hot_patches_explicit_desired_hostname_change() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = config_with_port_forwards(Vec::new());
         desired.hostname = Some("desired-host".to_string());
 
-        let patch = web_source_runtime_patch(&current, &desired).expect("build patch");
+        let action = prepare_web_source_runtime_reconcile_from_current(&current, desired)
+            .expect("prepare reconcile");
+        let RuntimeReconcileAction::Patch(patch) = action else {
+            panic!("hostname-only change should use a hot patch");
+        };
 
-        assert!(patch.is_none());
+        assert_eq!(patch.hostname.as_deref(), Some("desired-host"));
+    }
+
+    #[test]
+    fn runtime_convergence_accepts_hostname_only_readback_difference() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.hostname = Some("device-host".to_string());
+
+        ensure_runtime_config_converged(&current, &desired, true)
+            .expect("hostname-only readback difference should be converged");
+    }
+
+    #[test]
+    fn runtime_convergence_rejects_omitted_hostname_before_apply() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.hostname = Some("device-host".to_string());
+
+        let err = ensure_runtime_config_converged(&current, &desired, false)
+            .expect_err("omitted hostname before apply should not converge");
+
+        assert!(
+            err.to_string()
+                .contains("runtime config still needs patch after reconcile")
+        );
+    }
+
+    #[test]
+    fn runtime_convergence_rejects_explicit_wrong_hostname_after_apply() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.hostname = Some("wrong-host".to_string());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.hostname = Some("device-host".to_string());
+
+        let err = ensure_runtime_config_converged(&current, &desired, true)
+            .expect_err("explicit wrong hostname should not converge");
+
+        assert!(
+            err.to_string()
+                .contains("runtime config still needs patch after reconcile")
+        );
+    }
+
+    #[test]
+    fn runtime_patch_clears_explicit_desired_hostname() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.hostname = Some("runtime-host".to_string());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.hostname = Some(String::new());
+
+        let patch = web_source_runtime_patch(&current, &desired)
+            .expect("build patch")
+            .expect("hot patch");
+
+        assert_eq!(patch.hostname.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn runtime_patch_normalizes_missing_runtime_hostname_for_explicit_clear() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.hostname = Some(String::new());
+
+        let action = prepare_web_source_runtime_reconcile_from_current(&current, desired)
+            .expect("prepare reconcile");
+
+        assert!(matches!(action, RuntimeReconcileAction::Unchanged(_)));
+    }
+
+    #[test]
+    fn runtime_patch_skips_matching_explicit_hostname() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.hostname = Some("desired-host".to_string());
+        let desired = current.clone();
+
+        let action = prepare_web_source_runtime_reconcile_from_current(&current, desired)
+            .expect("prepare reconcile");
+
+        assert!(matches!(action, RuntimeReconcileAction::Unchanged(_)));
+    }
+
+    #[test]
+    fn runtime_patch_uses_core_normalized_hostname() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.hostname = Some("a".repeat(33));
+
+        let patch = web_source_runtime_patch(&current, &desired)
+            .expect("build patch")
+            .expect("hot patch");
+
+        assert_eq!(patch.hostname.as_deref(), Some("a".repeat(32).as_str()));
+    }
+
+    #[test]
+    fn runtime_patch_removes_hostname_control_characters() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.hostname = Some("node\u{7}-name".to_string());
+
+        let patch = web_source_runtime_patch(&current, &desired)
+            .expect("build patch")
+            .expect("hot patch");
+
+        assert_eq!(patch.hostname.as_deref(), Some("node-name"));
+    }
+
+    #[test]
+    fn runtime_patch_normalizes_control_only_hostname_to_clear() {
+        let mut current = config_with_port_forwards(Vec::new());
+        current.hostname = Some("runtime-host".to_string());
+        let mut desired = config_with_port_forwards(Vec::new());
+        desired.hostname = Some("\u{7}\n".to_string());
+
+        let patch = web_source_runtime_patch(&current, &desired)
+            .expect("build patch")
+            .expect("hot patch");
+
+        assert_eq!(patch.hostname.as_deref(), Some(""));
     }
 }

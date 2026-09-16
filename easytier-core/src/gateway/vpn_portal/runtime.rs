@@ -2,7 +2,7 @@
 //!
 //! Native adapters authenticate clients and yield sessions. This module owns
 //! configured client identities, attached-peer lifetimes, per-client
-//! generations, and IPv4 address translation at the Host packet seam.
+//! generations, and raw IPv4 packet forwarding at the Host packet seam.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::runtime::{CoreInstanceRuntimeConfig, CoreRuntimeConfigStore},
     events::{CoreEvent, CoreEventSink},
+    foundation::stats::{CounterHandle, LabelSet, LabelType, MetricName, StatsManager},
     peers::{
         attached::{AttachedPeerConfig, AttachedPeerRuntime},
         peer_manager::PeerManagerCore,
@@ -29,15 +30,12 @@ use crate::{
     socket::SocketListener,
 };
 
-use super::ipv4_translator::{rewrite_ipv4_destination, rewrite_ipv4_source};
-
 pub const MAX_VPN_PORTAL_CLIENTS: usize = 64;
-pub const DEFAULT_PORTAL_CLIENT_ADDRESS: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortalClientConfig {
     pub name: String,
-    pub virtual_ip: Ipv4Addr,
+    pub virtual_ip: Ipv4Inet,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
 }
@@ -153,6 +151,38 @@ impl Default for ClientStatus {
     }
 }
 
+#[derive(Clone)]
+struct PortalClientTrafficMetrics {
+    upload_bytes: CounterHandle,
+    upload_packets: CounterHandle,
+    download_bytes: CounterHandle,
+    download_packets: CounterHandle,
+}
+
+impl PortalClientTrafficMetrics {
+    fn new(stats: &StatsManager, network_name: &str, client_name: &str) -> Self {
+        let labels = LabelSet::new()
+            .with_label_type(LabelType::NetworkName(network_name.to_owned()))
+            .with_label_type(LabelType::VpnPortalClient(client_name.to_owned()));
+        Self {
+            upload_bytes: stats.get_counter(MetricName::VpnPortalClientBytesTx, labels.clone()),
+            upload_packets: stats.get_counter(MetricName::VpnPortalClientPacketsTx, labels.clone()),
+            download_bytes: stats.get_counter(MetricName::VpnPortalClientBytesRx, labels.clone()),
+            download_packets: stats.get_counter(MetricName::VpnPortalClientPacketsRx, labels),
+        }
+    }
+
+    fn record_upload(&self, bytes: usize) {
+        self.upload_bytes.add(bytes as u64);
+        self.upload_packets.inc();
+    }
+
+    fn record_download(&self, bytes: usize) {
+        self.download_bytes.add(bytes as u64);
+        self.download_packets.inc();
+    }
+}
+
 struct PortalRuntime {
     cancel: CancellationToken,
     tasks: JoinSet<()>,
@@ -168,6 +198,7 @@ pub struct PortalModule {
     events: Arc<dyn CoreEventSink>,
     statuses: Arc<RwLock<BTreeMap<String, ClientStatus>>>,
     session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+    traffic_metrics: Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>>,
     runtime: Mutex<Option<PortalRuntime>>,
 }
 
@@ -182,6 +213,25 @@ impl PortalModule {
         if let Some(config) = config.as_ref() {
             validate_clients(config, runtime_config.snapshot().as_ref())?;
         }
+        let network_name = runtime_config
+            .snapshot()
+            .peer
+            .runtime
+            .network_identity
+            .network_name
+            .clone();
+        let stats = peer_manager.stats_manager();
+        let traffic_metrics = config
+            .as_ref()
+            .into_iter()
+            .flat_map(|config| &config.clients)
+            .map(|client| {
+                (
+                    client.name.clone(),
+                    PortalClientTrafficMetrics::new(&stats, &network_name, &client.name),
+                )
+            })
+            .collect();
         Ok(Arc::new(Self {
             operation: Mutex::new(()),
             peer_manager,
@@ -191,6 +241,7 @@ impl PortalModule {
             events,
             statuses: Arc::new(RwLock::new(BTreeMap::new())),
             session_locks: Arc::new(RwLock::new(BTreeMap::new())),
+            traffic_metrics: Arc::new(StdRwLock::new(traffic_metrics)),
             runtime: Mutex::new(None),
         }))
     }
@@ -253,10 +304,29 @@ impl PortalModule {
         let applied_clients = candidate.clients;
 
         {
+            let network_name = self
+                .runtime_config
+                .snapshot()
+                .peer
+                .runtime
+                .network_identity
+                .network_name
+                .clone();
+            let stats = self.peer_manager.stats_manager();
+            let mut traffic_metrics = self.traffic_metrics.write().unwrap();
+            traffic_metrics.retain(|name, _| applied.contains(name));
+            for name in &applied {
+                traffic_metrics.entry(name.clone()).or_insert_with(|| {
+                    PortalClientTrafficMetrics::new(&stats, &network_name, name)
+                });
+            }
+        }
+
+        {
             let mut statuses = self.statuses.write().await;
             statuses.retain(|name, _| applied.contains(name));
-            for name in applied {
-                statuses.entry(name).or_default();
+            for name in &applied {
+                statuses.entry(name.clone()).or_default();
             }
         }
         {
@@ -323,6 +393,7 @@ impl PortalModule {
                 self.config.clone().expect("checked above"),
                 self.statuses.clone(),
                 self.session_locks.clone(),
+                self.traffic_metrics.clone(),
                 self.events.clone(),
                 cancel.clone(),
                 start_signal.clone(),
@@ -350,6 +421,7 @@ impl PortalModule {
         config: Arc<StdRwLock<PortalRuntimeConfig>>,
         statuses: Arc<RwLock<BTreeMap<String, ClientStatus>>>,
         session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+        traffic_metrics: Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>>,
         events: Arc<dyn CoreEventSink>,
         cancel: CancellationToken,
         start_signal: CancellationToken,
@@ -374,6 +446,7 @@ impl PortalModule {
                             config.clone(),
                             statuses.clone(),
                             session_locks.clone(),
+                            traffic_metrics.clone(),
                             events.clone(),
                             cancel.clone(),
                         ));
@@ -400,6 +473,7 @@ impl PortalModule {
         config: Arc<StdRwLock<PortalRuntimeConfig>>,
         statuses: Arc<RwLock<BTreeMap<String, ClientStatus>>>,
         session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+        traffic_metrics: Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>>,
         events: Arc<dyn CoreEventSink>,
         cancel: CancellationToken,
     ) {
@@ -422,13 +496,19 @@ impl PortalModule {
             _ = cancel.cancelled() => return,
             guard = session_lock.lock() => guard,
         };
+        let Some(traffic) = traffic_metrics.read().unwrap().get(&client.name).cloned() else {
+            // The client was removed by a concurrent config update while this
+            // session was waiting for the session lock.
+            tracing::warn!(client = %client.name, "VPN portal client removed before session started");
+            return;
+        };
         let generation = {
             let mut statuses = statuses.write().await;
             let status = statuses.entry(client.name.clone()).or_default();
             status.generation = status.generation.wrapping_add(1);
             status.state = PortalClientState::Connecting;
             status.endpoint = Some(session.endpoint.borrow_and_update().clone());
-            status.tunnel_ip = None;
+            status.tunnel_ip = Some(client.virtual_ip.address());
             status.error = None;
             status.generation
         };
@@ -481,76 +561,35 @@ impl PortalModule {
         let mut client_stream = session.from_client;
         let endpoint = session.endpoint;
         let client_sink = session.to_client;
-        let client_ip = Arc::new(Mutex::new(None::<Ipv4Addr>));
         let client_to_mesh = {
             let attached = attached.clone();
-            let client_ip = client_ip.clone();
-            let statuses = statuses.clone();
             let name = client.name.clone();
-            let virtual_ip = client.virtual_ip;
+            let virtual_ip = client.virtual_ip.address();
+            let traffic = traffic.clone();
             tokio::spawn(async move {
-                while let Some(mut payload) = client_stream.recv().await {
-                    let Some(source) = ipv4_source(&payload) else {
+                while let Some(payload) = client_stream.recv().await {
+                    if !has_ipv4_source(&payload, virtual_ip) {
+                        tracing::warn!(client = %name, expected = ?virtual_ip, "VPN client source does not match its assigned address");
                         continue;
-                    };
-                    match *client_ip.lock().await {
-                        Some(expected) if expected != source => {
-                            tracing::warn!(client = %name, ?expected, ?source, "VPN client source changed");
-                            continue;
-                        }
-                        None | Some(_) => {}
-                    }
-                    if rewrite_ipv4_source(&mut payload, source, virtual_ip).is_err() {
-                        continue;
-                    }
-                    let learned = {
-                        let mut tunnel_ip = client_ip.lock().await;
-                        if tunnel_ip.is_none() {
-                            *tunnel_ip = Some(source);
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if learned {
-                        let mut statuses = statuses.write().await;
-                        if let Some(status) = statuses.get_mut(&name)
-                            && status.generation == generation
-                        {
-                            status.tunnel_ip = Some(source);
-                        }
                     }
                     if let Err(error) = attached.send_packet(&payload).await {
                         tracing::debug!(?error, client = %name, "attached peer send failed");
                         break;
                     }
+                    traffic.record_upload(payload.len());
                 }
             })
         };
         let mesh_to_client = {
             let attached = attached.clone();
-            let client_ip = client_ip.clone();
-            let statuses = statuses.clone();
-            let name = client.name.clone();
-            let virtual_ip = client.virtual_ip;
             tokio::spawn(async move {
                 while let Some(packet) = attached.recv_packet().await {
-                    let Some(tunnel_ip) = *client_ip.lock().await else {
-                        continue;
-                    };
-                    let mut payload = packet.payload().to_vec();
-                    if rewrite_ipv4_destination(&mut payload, virtual_ip, tunnel_ip).is_err() {
-                        continue;
-                    }
+                    let payload = packet.payload().to_vec();
+                    let bytes = payload.len();
                     if client_sink.send(payload).await.is_err() {
                         break;
                     }
-                    let mut statuses = statuses.write().await;
-                    if let Some(status) = statuses.get_mut(&name)
-                        && status.generation == generation
-                    {
-                        status.tunnel_ip = Some(tunnel_ip);
-                    }
+                    traffic.record_download(bytes);
                 }
             })
         };
@@ -706,10 +745,14 @@ impl PortalModule {
                 let status = statuses.get(&client.name).cloned().unwrap_or_default();
                 let client_config = match (self.host.as_ref(), listener_url.as_ref()) {
                     (Some(host), Some(listener_url)) => {
+                        let mut client_allowed_ips = allowed_ips.clone();
+                        client_allowed_ips.push(client.virtual_ip.network().to_string());
+                        client_allowed_ips.sort();
+                        client_allowed_ips.dedup();
                         host.render_client_config(&PortalClientConfigPlan {
                             name: client.name.clone(),
-                            address: DEFAULT_PORTAL_CLIENT_ADDRESS,
-                            allowed_ips: allowed_ips.clone(),
+                            address: client.virtual_ip.address(),
+                            allowed_ips: client_allowed_ips,
                             listener_url: listener_url.clone(),
                         })
                     }
@@ -717,7 +760,7 @@ impl PortalModule {
                 };
                 PortalClientInfoSnapshot {
                     name: client.name.clone(),
-                    virtual_ip: client.virtual_ip,
+                    virtual_ip: client.virtual_ip.address(),
                     groups: client.groups.clone(),
                     state: status.state,
                     peer_id: status.peer_id,
@@ -743,12 +786,6 @@ impl PortalModule {
         let mut allowed = BTreeSet::new();
         for route in self.peer_manager.list_route_snapshots().await {
             allowed.extend(route.proxy_cidrs);
-        }
-        if let Some(ipv4) = snapshot.peer.runtime.core.routes.ipv4.as_ref()
-            && let IpAddr::V4(address) = ipv4.address
-            && let Ok(inet) = Ipv4Inet::new(address, ipv4.prefix_len)
-        {
-            allowed.insert(inet.network().to_string());
         }
         for proxy in &snapshot.peer.runtime.core.routes.proxy_networks {
             let mapped = proxy.mapped.as_ref().unwrap_or(&proxy.real);
@@ -784,7 +821,7 @@ fn validate_clients(
         if !names.insert(client.name.as_str()) {
             anyhow::bail!("duplicate VPN portal client name: {}", client.name);
         }
-        if !addresses.insert(client.virtual_ip) {
+        if !addresses.insert(client.virtual_ip.address()) {
             anyhow::bail!("duplicate VPN portal virtual IP: {}", client.virtual_ip);
         }
         for group in &client.groups {
@@ -814,33 +851,28 @@ fn validate_runtime_compatibility(
     {
         anyhow::bail!("VPN portal requires an admin node with a non-empty network secret");
     }
-    if snapshot.services.dhcp_ipv4 {
-        anyhow::bail!("VPN portal does not support DHCP IPv4 on the portal node");
-    }
-    let prefix = snapshot
+    let host_address = snapshot
         .peer
         .runtime
         .core
         .routes
         .ipv4
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("VPN portal requires a static IPv4 address"))?;
-    let IpAddr::V4(portal_ip) = prefix.address else {
-        anyhow::bail!("VPN portal requires an IPv4 route prefix");
-    };
-    let network = Ipv4Inet::new(portal_ip, prefix.prefix_len)
-        .map_err(|error| anyhow::anyhow!("invalid portal IPv4 prefix: {error}"))?
-        .network();
+        .and_then(|prefix| match prefix.address {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        });
     for client in &config.clients {
-        if client.virtual_ip == portal_ip
-            || !network.contains(&client.virtual_ip)
-            || client.virtual_ip == network.first_address()
-            || client.virtual_ip == network.last_address()
+        let address = client.virtual_ip.address();
+        let network = client.virtual_ip.network();
+        if host_address == Some(address)
+            || address == network.first_address()
+            || address == network.last_address()
         {
             anyhow::bail!(
                 "VPN portal client {} has an unusable virtual IP {}",
                 client.name,
-                client.virtual_ip
+                address
             );
         }
     }
@@ -877,6 +909,10 @@ fn ipv4_source(payload: &[u8]) -> Option<Ipv4Addr> {
         payload[14],
         payload[15],
     ))
+}
+
+fn has_ipv4_source(payload: &[u8], expected: Ipv4Addr) -> bool {
+    ipv4_source(payload) == Some(expected)
 }
 
 #[cfg(test)]
@@ -937,7 +973,12 @@ mod tests {
         }
 
         fn render_client_config(&self, plan: &PortalClientConfigPlan) -> String {
-            format!("config:{}", plan.name)
+            format!(
+                "config:{}:{}:{}",
+                plan.name,
+                plan.address,
+                plan.allowed_ips.join(",")
+            )
         }
     }
 
@@ -1092,9 +1133,27 @@ mod tests {
     fn client(name: &str, virtual_ip: Ipv4Addr, groups: &[&str]) -> PortalClientConfig {
         PortalClientConfig {
             name: name.to_owned(),
-            virtual_ip,
+            virtual_ip: Ipv4Inet::new(virtual_ip, 24).unwrap(),
             groups: groups.iter().map(|group| (*group).to_owned()).collect(),
         }
+    }
+
+    fn traffic_metrics(
+        peer_manager: &PeerManagerCore,
+        clients: &[&str],
+    ) -> Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>> {
+        let stats = peer_manager.stats_manager();
+        Arc::new(StdRwLock::new(
+            clients
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_owned(),
+                        PortalClientTrafficMetrics::new(&stats, "portal-test", name),
+                    )
+                })
+                .collect(),
+        ))
     }
 
     fn raw_ipv4(source: Ipv4Addr, destination: Ipv4Addr) -> Vec<u8> {
@@ -1108,6 +1167,71 @@ mod tests {
         packet[20] = 8;
         packet
     }
+
+    #[test]
+    fn portal_client_packet_requires_its_assigned_source() {
+        let assigned = Ipv4Addr::new(10, 82, 0, 2);
+
+        assert!(has_ipv4_source(
+            &raw_ipv4(assigned, Ipv4Addr::new(10, 82, 0, 1)),
+            assigned
+        ));
+        assert!(!has_ipv4_source(
+            &raw_ipv4(Ipv4Addr::new(10, 82, 0, 99), Ipv4Addr::new(10, 82, 0, 1)),
+            assigned
+        ));
+        assert!(!has_ipv4_source(&[0u8; 8], assigned));
+    }
+
+    #[tokio::test]
+    async fn portal_client_traffic_accumulates_across_sessions() {
+        let stats = StatsManager::new();
+        let first = PortalClientTrafficMetrics::new(&stats, "portal-test", "client-a");
+        first.record_upload(80);
+        first.record_download(120);
+        drop(first);
+
+        let reconnected = PortalClientTrafficMetrics::new(&stats, "portal-test", "client-a");
+        reconnected.record_upload(20);
+        reconnected.record_download(30);
+
+        let labels = LabelSet::new()
+            .with_label_type(LabelType::NetworkName("portal-test".to_owned()))
+            .with_label_type(LabelType::VpnPortalClient("client-a".to_owned()));
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientBytesTx, &labels)
+                .unwrap()
+                .value,
+            100
+        );
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientPacketsTx, &labels)
+                .unwrap()
+                .value,
+            2
+        );
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientBytesRx, &labels)
+                .unwrap()
+                .value,
+            150
+        );
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientPacketsRx, &labels)
+                .unwrap()
+                .value,
+            2
+        );
+        assert!(stats.export_prometheus().contains(
+            "vpn_portal_client_bytes_tx{network_name=\"portal-test\",vpn_portal_client=\"client-a\"} 100"
+        ));
+        stats.stop_cleanup_task().await;
+    }
+
     fn network_runtime() -> (Arc<PeerManagerCore>, CoreRuntimeConfigStore) {
         network_runtime_with_secure_mode(false)
     }
@@ -1214,6 +1338,22 @@ mod tests {
     }
 
     #[test]
+    fn portal_client_cidr_is_independent_of_host_addressing() {
+        let runtime_config = runtime_config();
+        runtime_config.update_peer_with(|peer| peer.runtime.core.routes.ipv4 = None);
+        runtime_config.update_services(|services| services.dhcp_ipv4 = true);
+        let config = PortalRuntimeConfig {
+            clients: vec![PortalClientConfig {
+                name: "alice".to_owned(),
+                virtual_ip: "10.82.0.2/16".parse().unwrap(),
+                groups: vec!["ops".to_owned()],
+            }],
+        };
+
+        validate_clients(&config, runtime_config.snapshot().as_ref()).unwrap();
+    }
+
+    #[test]
     fn portal_session_debug_redacts_identity_private_key() {
         let identity_private_key = [173u8; 32];
         let (_to_runtime, from_client) = mpsc::channel(1);
@@ -1233,11 +1373,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_session_publishes_learned_tunnel_ip_without_mesh_reply() {
+    async fn portal_session_publishes_virtual_ip_before_first_client_packet() {
         let (peer_manager, runtime_config) = network_runtime();
         peer_manager.run().await.unwrap();
+        let virtual_ip = Ipv4Addr::new(10, 82, 0, 2);
         let config = PortalRuntimeConfig {
-            clients: vec![client("alice", Ipv4Addr::new(10, 82, 0, 2), &["ops"])],
+            clients: vec![client("alice", virtual_ip, &["ops"])],
         };
         let statuses = Arc::new(RwLock::new(BTreeMap::from([(
             "alice".to_owned(),
@@ -1248,7 +1389,7 @@ mod tests {
             Arc::new(Mutex::new(())),
         )])));
         let (to_runtime, from_client) = mpsc::channel(1);
-        let (to_client, _from_runtime) = mpsc::channel(1);
+        let (to_client, mut from_runtime) = mpsc::channel(1);
         let (endpoint_sender, endpoint) = tokio::sync::watch::channel("portal://alice".to_owned());
         let session = PortalSession {
             client_name: "alice".to_owned(),
@@ -1266,38 +1407,71 @@ mod tests {
             Arc::new(StdRwLock::new(config)),
             statuses.clone(),
             session_locks,
+            traffic_metrics(&peer_manager, &["alice"]),
             Arc::new(()),
             cancel,
         ));
 
-        to_runtime
-            .send(raw_ipv4(
-                DEFAULT_PORTAL_CLIENT_ADDRESS,
-                Ipv4Addr::new(10, 82, 0, 1),
-            ))
-            .await
-            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let status = statuses.read().await.get("alice").cloned().unwrap();
-                if status.tunnel_ip == Some(DEFAULT_PORTAL_CLIENT_ADDRESS) {
+                if status.state == PortalClientState::Online && status.tunnel_ip == Some(virtual_ip)
+                {
                     return;
                 }
                 assert_ne!(
                     status.state,
                     PortalClientState::Error,
-                    "portal session failed before learning tunnel IP: {:?}",
+                    "portal session failed before publishing virtual IP: {:?}",
                     status.error
                 );
                 assert!(
                     !task.is_finished(),
-                    "portal session ended before learning tunnel IP"
+                    "portal session ended before publishing virtual IP"
                 );
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("learned tunnel IP was not published");
+        .expect("configured virtual IP was not published before the first client packet");
+
+        let mesh_packet = raw_ipv4(Ipv4Addr::new(10, 82, 0, 1), virtual_ip);
+        let outbound = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let _ = peer_manager
+                    .send_msg_by_ip(
+                        crate::packet::ZCPacket::new_with_payload(&mesh_packet),
+                        IpAddr::V4(virtual_ip),
+                        false,
+                    )
+                    .await;
+                if let Ok(Some(packet)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(20), from_runtime.recv())
+                        .await
+                {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("mesh packet was not delivered before the first client packet");
+        assert_eq!(&outbound[16..20], virtual_ip.octets().as_slice());
+        let labels = LabelSet::new()
+            .with_label_type(LabelType::NetworkName("portal-test".to_owned()))
+            .with_label_type(LabelType::VpnPortalClient("alice".to_owned()));
+        assert!(
+            peer_manager
+                .stats_manager()
+                .get_metric(MetricName::VpnPortalClientBytesRx, &labels)
+                .is_some_and(|metric| metric.value >= mesh_packet.len() as u64)
+        );
+        assert!(
+            peer_manager
+                .stats_manager()
+                .get_metric(MetricName::VpnPortalClientPacketsRx, &labels)
+                .is_some_and(|metric| metric.value >= 1)
+        );
+
         endpoint_sender.send("portal://roamed".to_owned()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -1358,6 +1532,7 @@ mod tests {
             Arc::new(StdRwLock::new(config)),
             statuses.clone(),
             session_locks,
+            traffic_metrics(&peer_manager, &["alice"]),
             events.clone(),
             cancel.clone(),
         ));
@@ -1464,35 +1639,30 @@ mod tests {
             Arc::new(StdRwLock::new(config)),
             statuses.clone(),
             session_locks,
+            traffic_metrics(&peer_manager, &["alice"]),
             events.clone(),
             CancellationToken::new(),
         ));
 
-        to_runtime
-            .send(raw_ipv4(
-                DEFAULT_PORTAL_CLIENT_ADDRESS,
-                Ipv4Addr::new(10, 82, 0, 1),
-            ))
-            .await
-            .unwrap();
+        let client_packet = raw_ipv4(virtual_ip, Ipv4Addr::new(10, 82, 0, 1));
+        to_runtime.send(client_packet.clone()).await.unwrap();
         let attached_peer_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let status = statuses.read().await.get("alice").cloned().unwrap();
-                if status.state == PortalClientState::Online
-                    && status.tunnel_ip == Some(DEFAULT_PORTAL_CLIENT_ADDRESS)
+                if status.state == PortalClientState::Online && status.tunnel_ip == Some(virtual_ip)
                 {
                     return status.peer_id.unwrap();
                 }
                 assert!(
                     !task.is_finished(),
-                    "portal session ended before learning its tunnel address: {:?}",
+                    "portal session ended before publishing its virtual address: {:?}",
                     status.error
                 );
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("portal session did not learn its tunnel address");
+        .expect("portal session did not publish its virtual address");
 
         drop(from_runtime);
         let mesh_packet = raw_ipv4(Ipv4Addr::new(10, 82, 0, 1), virtual_ip);
@@ -1517,6 +1687,26 @@ mod tests {
             panic!("portal session did not stop when its outbound task ended");
         }
         task.await.unwrap();
+
+        let labels = LabelSet::new()
+            .with_label_type(LabelType::NetworkName("portal-test".to_owned()))
+            .with_label_type(LabelType::VpnPortalClient("alice".to_owned()));
+        assert_eq!(
+            peer_manager
+                .stats_manager()
+                .get_metric(MetricName::VpnPortalClientBytesTx, &labels)
+                .unwrap()
+                .value,
+            client_packet.len() as u64
+        );
+        assert_eq!(
+            peer_manager
+                .stats_manager()
+                .get_metric(MetricName::VpnPortalClientPacketsTx, &labels)
+                .unwrap()
+                .value,
+            1
+        );
 
         let status = statuses.read().await.get("alice").cloned().unwrap();
         assert_eq!(status.state, PortalClientState::Offline);
@@ -1628,6 +1818,39 @@ mod tests {
             events.runtime_visible_on_start.load(Ordering::SeqCst),
             "VpnPortalStarted was emitted before runtime installation"
         );
+        module.stop().await;
+        peer_manager.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn portal_client_config_routes_its_own_network_not_the_host_network() {
+        let (peer_manager, runtime_config) = network_runtime();
+        let module = PortalModule::new(
+            peer_manager.clone(),
+            runtime_config,
+            Some(PortalRuntimeConfig {
+                clients: vec![PortalClientConfig {
+                    name: "alice".to_owned(),
+                    virtual_ip: "10.90.0.2/16".parse().unwrap(),
+                    groups: vec!["ops".to_owned()],
+                }],
+            }),
+            Some(StaticPortalHost::new(vec![Box::new(
+                PendingPortalListener {
+                    url: "test://127.0.0.1:10004".parse().unwrap(),
+                    accept_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )])),
+            Arc::new(()),
+        )
+        .unwrap();
+
+        module.start().await.unwrap();
+        let snapshot = module.info_snapshot().await;
+
+        assert!(snapshot.clients[0].client_config.contains("10.90.0.2"));
+        assert!(snapshot.clients[0].client_config.contains("10.90.0.0/16"));
+        assert!(!snapshot.clients[0].client_config.contains("10.82.0.0/24"));
         module.stop().await;
         peer_manager.clear_resources().await;
     }
