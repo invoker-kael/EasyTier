@@ -328,3 +328,5 @@ jobs:
           files: |
             release-assets/**/*
           fail_on_unmatched_files: true
+
+# Release trigger: 2026-10-01
