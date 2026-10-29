@@ -1,0 +1,15 @@
+FROM docker.io/easytier/easytier:v2.7.0@sha256:b5c3f697bdfd006a11afd4649f0072514fbef2d3cd4772adf625585a17a89823
+
+LABEL org.opencontainers.image.title="EasyTier Web Console"
+LABEL org.opencontainers.image.description="Self-hosted EasyTier web console"
+LABEL org.opencontainers.image.source="https://github.com/invoker-kael/EasyTier"
+LABEL org.opencontainers.image.version="v2.7.0"
+
+EXPOSE 11211/tcp 22020/udp
+VOLUME ["/data"]
+
+ENTRYPOINT ["/sbin/tini", "--", "easytier-web-embed"]
+CMD ["--api-server-port", "11211", "--config-server-port", "22020", "--config-server-protocol", "udp", "--db", "/data/et.db"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD-SHELL wget -q -O /dev/null http://127.0.0.1:11211/ || exit 1
